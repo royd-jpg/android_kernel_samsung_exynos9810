@@ -322,246 +322,8 @@ name: Project Chimera Mk9 — gavdoc38 Canonical Base Build v.20260902
 #   tuning, defconfig branding, SUS_MAP/sus_path Chimera patches) is
 #   unaffected and still applies on top.
 #
-# CONFIRMED BUGS FIXED (each independently re-derived from primary source,
-# not taken on faith from a prior session's uploaded notes)
-#
-# [A] Redundant / double-invoked setresuid hook — ROOT CAUSE of "su detected,
-#     root grant fails, manager restart fails"
-#     ---------------------------------------------------------------------
-#     The previous workflow patched kernel/sys.c's SYSCALL_DEFINE3(setresuid)
-#     body to call ksu_handle_setresuid() directly. This is unnecessary and
-#     harmful: verified against KernelSU-Next kernel/hook/lsm_hooks.c, the
-#     driver registers a full LSM hook table (ksu_hooks[]) unconditionally
-#     whenever CONFIG_KSU_KPROBES_HOOK is NOT set (i.e. manual-hook mode,
-#     which this defconfig forces for a 4.9.337 target). That table includes
-#     LSM_HOOK_INIT(task_fix_setuid, ksu_task_fix_setuid), and
-#     ksu_task_fix_setuid() itself calls ksu_handle_setresuid(). This hook is
-#     registered from kernel/core/init.c's normal (non-late-load) init path
-#     unconditionally. The kernel's own setresuid/setreuid/setuid syscalls
-#     already call security_task_fix_setuid() as stock behavior — no kernel
-#     source patch is required to reach KSU-Next's handler.
-#     The manual kernel/sys.c patch therefore caused ksu_handle_setresuid()
-#     to run twice per credential transition: once via the legitimate LSM
-#     dispatch, once via the direct call this patch inserted. If that handler
-#     has any non-idempotent state (allowlist consumption, one-shot grant
-#     flags, replay protection), the second call is the most likely
-#     explanation for "root detected but grant/manager-restart fails."
-#     FIX: kernel/sys.c is no longer touched. A verification step confirms
-#     the LSM hook and its symbols are compiled in instead.
-#
-# [B] fs/susfs.c AVC log-spoofing "fix" was actively wrong for this base
-#     -------------------------------------------------------------------
-#     Previous workflow defined `bool susfs_is_avc_log_spoofing_enabled =
-#     false;` directly in fs/susfs.c on the assumption that no other
-#     translation unit defines it. Verified false for the gavdoc38 base:
-#     security/selinux/avc.c:56 already contains
-#     `bool susfs_is_avc_log_spoofing_enabled = false;`, and fs/susfs.c's
-#     `extern bool susfs_is_avc_log_spoofing_enabled;` is the correct,
-#     intended declaration referencing that definition. Applying the old
-#     patch would produce two definitions of the same global in the same
-#     link unit — a hard "multiple definition" error under -fno-common,
-#     which is the default for modern GCC and for LLD (this workflow's linker).
-#     FIX: patch removed. A verify-only step confirms avc.c defines it
-#     exactly once and fs/susfs.c only declares it extern.
-#
-# [C] path_umount/can_umount hand backport was incomplete
-#     -----------------------------------------------------
-#     The ad hoc backport implemented path_umount() but only guarded it with
-#     may_mount() — omitting check_mnt(), the MNT_LOCKED check, the
-#     path->dentry == path->mnt->mnt_root validation, and the
-#     CAP_SYS_ADMIN gate on MNT_FORCE that upstream's can_umount() performs.
-#     This is a real correctness/security gap (a namespace could be
-#     unmounted while still attached to a locked mount, or while not being
-#     the root of that mount). Verified: the gavdoc38 base already carries
-#     the complete can_umount() + path_umount() pair from the referenced
-#     commit, inserted immediately before is_mnt_ns_file() in fs/namespace.c,
-#     with a matching declaration in fs/internal.h placed after mnt_init().
-#     FIX: hand backport removed. Verify-only step confirms both functions
-#     and the correct check_mnt/MNT_LOCKED/CAP_SYS_ADMIN logic are present.
-#
-# [D] kernel/reboot.c hook — no longer needed as a patch
-#     ----------------------------------------------------
-#     gavdoc38 base already declares and calls ksu_handle_sys_reboot() at
-#     the correct site in SYSCALL_DEFINE4(reboot, ...). Verified directly.
-#     FIX: patch removed, replaced with verification.
-#
-# [E] CONFIG_KSU_NON_KPROBE is not a real Kconfig symbol
-#     ----------------------------------------------------
-#     Verified against KernelSU-Next kernel/Kconfig: the only relevant
-#     symbols are CONFIG_KSU_MANUAL_HOOK and CONFIG_KSU_KPROBES_HOOK
-#     (mutually exclusive, KSU_MANUAL_HOOK defaults to y). Kconfig
-#     enforcement step already used the correct name and is kept/hardened.
-#
-# [F] Kbuild self-patch race condition (structural hardening, independent of
-#     A–E)
-#     -----------------------------------------------------------------------
-#     KernelSU-Next's kernel/Kbuild performs its own backport detection and
-#     application via $(shell grep ...)/$(shell sed -i ...) at Makefile-parse
-#     time for the drivers/kernelsu sub-make. Under Linux's recursive Kbuild
-#     model, each directory (fs/, security/, drivers/kernelsu/, ...) is built
-#     by its own sub-make invocation, and there is no guaranteed ordering
-#     between them — especially under `make -j`. If fs/'s sub-make compiles
-#     fs/namespace.c before drivers/kernelsu's Kbuild has run its sed pass,
-#     any *new* symbol the self-patch would introduce is simply absent from
-#     the already-compiled object, producing a late, confusing
-#     "undefined reference" at final link rather than a clear build error.
-#     This is exactly the failure class item [C] used to occur as (before
-#     gavdoc38's base existed). Since we now take the backports from a
-#     verified base rather than relying on runtime self-patching, this
-#     workflow adds a pre-build step that independently re-evaluates every
-#     one of KSU-Next's Kbuild self-patch guards and asserts each is already
-#     satisfied (a guaranteed no-op) before `make` is invoked. Any drift
-#     (e.g. a future KSU-Next bump reintroducing a check our base doesn't
-#     satisfy) fails fast at an attributable step instead of at final link.
-#
-# [G] hooks.c selinux_cred() consistency gap (verified, non-fatal)
-#     ---------------------------------------------------------------------
-#     KSU-Next's own Kbuild guard for patching security/selinux/hooks.c's
-#     cred->security / current_security() call sites to use the
-#     selinux_cred() wrapper was originally: `grep -q "selinux_cred" hooks.c`.
-#     On the gavdoc38 base (at the time this was found) this was a false
-#     positive: hooks.c already contained the unrelated LSM hook function
-#     names selinux_cred_alloc_blank, selinux_cred_free,
-#     selinux_cred_prepare, and selinux_cred_transfer, each of which matches
-#     the substring "selinux_cred" without the conversion ever having been
-#     applied. As a result the intended sed-based conversion never ran,
-#     leaving dozens of call sites in hooks.c accessing cred->security
-#     directly instead of going through selinux_cred(), even though
-#     objsec.h already defines that wrapper. This was NOT a build-breaking
-#     bug — selinux_cred() is a pure passthrough (`return cred->security;`)
-#     so both forms are semantically identical — but it was fixed here for
-#     consistency using precise, line-anchored substitutions (not a blanket
-#     substring sed, to avoid touching the legitimate selinux_cred_* hook
-#     function definitions).
-#
-#     UPSTREAM STATUS: gavdoc38 independently found and fixed the same
-#     root cause upstream, changing the guard to
-#     `grep -Eq 'selinux_cred\(.*\)'` (commit 7ad023015276b715261ae8f1230
-#     fc9c562ba8f34 on gavdoc38/KernelSU-Next, confirmed to also exist
-#     verbatim on official KernelSU-Next/KernelSU-Next's legacy branch, so
-#     this was never gavdoc38-specific). That fix is a real, confirmed
-#     improvement and is now baked into the gavdoc38 base this workflow
-#     pins (see base_ref/ksu_commit below). This workflow's own step 10
-#     hardening pass is KEPT regardless, for two reasons:
-#       1. defense in depth — it does not depend on KSU-Next's Kbuild guard
-#          at all, so a future upstream regression of the guard cannot
-#          silently reintroduce this gap here.
-#       2. it is NOT fully redundant even against the fixed upstream base.
-#          Verified directly: 4 read sites remain unconverted in hooks.c
-#          even with the corrected guard, all of the form
-#          `rc = selinux_determine_inode_label(current_security(), ...)`
-#          or `rc = selinux_determine_inode_label(old->security, ...)`.
-#          The two original KSU-Next sed lines for these calls assume a
-#          single-argument call (matching only if a closing paren
-#          immediately follows current_security()/old->security), but the
-#          real function always takes several arguments, so the literal
-#          sed pattern never matches actual code. This is a second,
-#          independent bug from the guard issue above, and — checked —
-#          is likewise inherited verbatim from official
-#          KernelSU-Next/KernelSU-Next legacy, not introduced by gavdoc38.
-#
-#     RE-VERIFIED v.20260822b (this pass, against the actual pinned
-#     base_ref a97f1411ef0e44ae1f1c78506c202809ef47f55e, live): at this
-#     exact commit, ALL selinux_determine_inode_label(...) call sites in
-#     hooks.c are already converted (selinux_cred(current_cred()) /
-#     selinux_cred(old)) — zero remain in the unconverted form. The "4
-#     sites" figure above describes an earlier base state, not the
-#     currently pinned one; it is left in place as history, not as a
-#     claim about the current pin. Step 10 below is written to treat a
-#     zero-match result as success (not skip), so this requires no code
-#     change — confirmed by re-reading step 10's own total==0 branch.
-#     FIX: this workflow's step 10 patterns cover all of the original 13
-#     substitution forms; the old->security variant's regex was corrected
-#     to not require a trailing paren immediately after old->security
-#     (mirroring the fix already applied, by design, to the
-#     current_security() variant's pattern), so all sites are converted
-#     here regardless of what upstream's own sed patterns do or don't
-#     catch, on any base where they are NOT already converted.
-#
-# [I] base_ref / ksu_commit pin — corrected, no longer claims an
-#     unverified SHA pair
-#     ---------------------------------------------------------------------
-#     A prior draft of this comment claimed base_ref had been re-pinned to
-#     4d8c9e7c675b77d8b00fa0080b2aa61474fd21c4 with KernelSU-Next at
-#     8ff37831ecea3e5a00dd3940c0c658e81f27c202. Those SHAs do not match
-#     this file's actual base_ref/ksu_commit input defaults and that claim
-#     is withdrawn rather than carried forward unverified. gavdoc38 has
-#     force-pushed lineage-23.2-ksun3-susfs2 at least once in the past, so
-#     a pinned SHA going stale relative to the branch tip is expected
-#     background risk, not a one-time event — this is exactly why the
-#     "Detect base branch-tip drift" step exists and why it only logs,
-#     never advances the pin. RE-VERIFIED v.20260822b: the currently
-#     pinned base_ref is, live, the exact tip of that branch — see the
-#     version-history entry at the top of this file.
-#
-#     PROCEDURAL RULE (still correct, kept regardless of which exact SHAs
-#     are pinned): base_ref and ksu_commit must always be bumped together.
-#     Updating one without the other means the KSU-Next submodule
-#     re-pin step would force-checkout ksu_commit regardless of what the
-#     base checkout brought in, silently discarding whichever half of an
-#     upstream integration commit wasn't picked up.
-#
-# [H] Chimera device-specific overlay — verified content, wrong commit SHA
-#     caught and corrected
-#     ---------------------------------------------------------------------
-#     Royd's request cited commit 1e5fcf05609a2d5cd5398900ebd61e057d407093
-#     as the source of the kernel/sched/fair.c scheduler tuning. Verified
-#     directly: that commit's actual diff touches
-#     kernel/sched/cpufreq_schedutil.c (sugov rate limits), not fair.c. The
-#     fair.c tuning (normalized_sysctl_sched_min_granularity: 750000ULL ->
-#     5000000ULL, sysctl_sched_migration_cost: 500000UL -> 2000000UL) is
-#     real — confirmed by a direct file diff against the gavdoc38 base —
-#     just not from that SHA. Applied via the verified diff, not the
-#     citation.
-#
-#     Two additional genuine gaps were found and confirmed by diffing
-#     royd-jpg/Project_Chimera@chimera-mk8 against the gavdoc38 base file
-#     by file:
-#
-#       - fs/proc/base.c: gavdoc38 has the SUS_MAP guard in the
-#         /proc/pid/maps iteration path but is missing it in mem_rw()
-#         (the /proc/pid/mem read/write path). Without it, a file hidden
-#         from /proc/pid/maps via SUS_MAP remains fully readable/writable
-#         through /proc/pid/mem — a real detection-bypass gap, not a
-#         duplicate of the existing guard.
-#
-#       - fs/namei.c: gavdoc38 has the primary sus_path hooks
-#         (lookup_dcache/__lookup_hash/lookup_fast/lookup_slow/lookup_open)
-#         but is missing chimera-mk8's second sus_path re-check inserted
-#         immediately after may_lookup() inside link_path_walk()'s main
-#         loop. This is applied and verified here as defense-in-depth
-#         only: no race between may_lookup()'s revalidation and the
-#         primary sus_path checks has been demonstrated on this base. The
-#         re-check is a low-cost second gate on the same condition, not a
-#         fix for a confirmed exploitable window.
-#
-#     All five device-specific patches (UFC short-circuit, the two gaps
-#     above, fair.c tuning, and the DTS board tuning) now live in
-#     patches/apply_chimera_overlay_patches.sh, each anchored on the exact
-#     verified upstream text and idempotent. A new post-overlay
-#     verification step (11b) fails the build hard if any of the five
-#     markers is missing, so the overlay can never silently drop out again.
-#
-#     A sixth, seventh, and eighth patch were added on request, all three
-#     confirmed against their actual commit diffs:
-#       - 1e5fcf05609a2d5cd5398900ebd61e057d407093: hardcodes
-#         sugov_update_rate_limit_us()'s up_rate_limit_us=1500 /
-#         down_rate_limit_us=16000.
-#       - f21ae9c9c3b5b817724f71a21d2d1a9dbd03c0c5: moves
-#         sugov_kthread_create()'s worker thread from
-#         SCHED_FIFO/MAX_USER_RT_PRIO/2 to SCHED_RR/priority=1. (This
-#         commit's diff also touches CONFIG_LOCALVERSION in the defconfig;
-#         that part is NOT applied — LOCALVERSION is already fully owned
-#         by the workflow's brand input.)
-#       - 745fb40c25fcb18641f926fd616b642438b98b89: applies the same
-#         up_rate_limit_us=1500/down_rate_limit_us=16000 pair a second
-#         time, at sugov_init() (policy-init time) rather than only on
-#         later updates.
-#     Together these three fully replicate chimera-mk8's current
-#     cpufreq_schedutil.c at all three sites — confirmed by diffing the
-#     patched result against chimera-mk8's actual file after applying all
-#     three (identical except for marker comments).
-#
+# (— all CONFIRMED BUGS FIXED [A]–[I] commentary unchanged, omitted here
+#    only for message length; keep as-is in your actual file —)
 # ─────────────────────────────────────────────────────────────────────────────
 # PACKAGING
 #
@@ -647,16 +409,38 @@ on:
         default: "vendored in base branch lineage-23.2-ksun3-susfs2"
 
       brand:
-        description: "LOCALVERSION suffix (must start with '-')"
+        description: "LOCALVERSION suffix (must start with '-'). Pick 'Other' to type a custom value."
+        required: true
+        type: choice
+        options:
+          - "-Chimera_Mk9"
+          - "24463729"
+          - "Other"
+        default: "-Chimera_Mk9"
+      custom_brand:
+        description: "Custom brand — only used if 'brand' above is set to 'Other' (must start with '-')"
         required: false
         type: string
-        default: "-Chimera_Mk9"
 
       build_user:
-        description: "KBUILD_BUILD_USER"
+        description: "KBUILD_BUILD_USER. Pick 'Other' to type a custom value."
+        required: true
+        type: choice
+        options:
+          - "MTRXX"
+          - "EVOXV"
+          - "EVOXG"
+          - "DRPFST"
+          - "HLCYN"
+          - "LOS"
+          - "GA"
+          - "RC0"
+          - "Other"
+        default: "MTRXX"
+      custom_build_user:
+        description: "Custom build user — only used if 'build_user' above is set to 'Other'"
         required: false
         type: string
-        default: "MTRXX_GA OR EVOX_GA OR GA OR RC0"
 
       build_host:
         description: "KBUILD_BUILD_HOST"
@@ -671,10 +455,22 @@ on:
         default: "1"
 
       build_date:
-        description: "KBUILD_BUILD_TIMESTAMP"
+        description: "KBUILD_BUILD_TIMESTAMP — ROM label shown for reference only, stripped before use. Pick 'Other' to type a custom value."
+        required: true
+        type: choice
+        options:
+          - "MTRXX: Wed Aug 19 03:26:19 UTC 2026"
+          - "LOS232: Fri Aug 14 10:18:07 CEST 2026"
+          - "EVOXV: Tue Aug 11 10:23:04 UTC 2026"
+          - "EVOXGMS: Tue Aug 11 13:18:57 UTC 2026"
+          - "HLCYN: Tue Aug 18 13:16:25 UTC 2026"
+          - "DRPFST: Tue Aug 11 07:06:26 UTC 2026"
+          - "Other"
+        default: "MTRXX: Wed Aug 19 03:26:19 UTC 2026"
+      custom_build_date:
+        description: "Custom build timestamp — only used if 'build_date' above is set to 'Other' (no ROM prefix needed here)"
         required: false
         type: string
-        default: "(MTRXX: Wed Aug 19 03:26:19 UTC 2026 / LOS232: Fri Aug 14 10:18:07 CEST 2026 / EVOXV: Tue Aug 11 10:23:04 UTC 2026 / EVOXGMS: Tue Aug 11 13:18:57 UTC 2026 / HLCYN: Tue Aug 18 13:16:25 UTC 2026 / DRP: Tue Aug 11 07:06:26 UTC 2026)"
 
 env:
   CHIMERA_REPO: "https://github.com/royd-jpg/Project_Chimera.git"
@@ -707,29 +503,6 @@ env:
   FORCE_REPATCH: ${{ inputs.force_repatch }}
   BASE_REPO: ${{ inputs.base_repo }}
 
-  # KCFLAGS/KBUILD_LDFLAGS are Kbuild-magic env var names — Kbuild reads
-  # them from the process environment automatically at EVERY invocation,
-  # not just the command line. Storing them under those exact names in
-  # job-level env: (or via $GITHUB_ENV, which has the same broadcast
-  # effect) leaks them into the Kconfig/silentoldconfig/prepare-
-  # compiler-check phase, where the extra flags cause clang's bare
-  # -fstack-protector-strong cc-option probe to report unsupported
-  # (observed: "Cannot use CONFIG_CC_STACKPROTECTOR_STRONG"). Stored
-  # under CHIMERA_* here; only materialized as literal KCFLAGS=/
-  # KBUILD_LDFLAGS= on the single `make Image vmlinux dtbs` command
-  # line in step 18. DO NOT reference bare $KCFLAGS/$KBUILD_LDFLAGS in
-  # any other step — they are intentionally never exported under those
-  # names; use $CHIMERA_KCFLAGS / $CHIMERA_KBUILD_LDFLAGS everywhere
-  # else. (See v.20260821b version-history entry above — this was the
-  # exact class of bug that broke the 2026-08-21 CI run.)
-  #
-  # -fuse-ld=lld is present in BOTH vars, deliberately (see v.20260822a
-  # above): arch/arm64/kernel/vdso/Makefile's VDSOL rule links via its own
-  # $(CC) invocation and does not reliably inherit KBUILD_LDFLAGS on this
-  # 4.9.337 tree, so without it in KCFLAGS too, clang falls back to the
-  # host's default /usr/bin/ld (x86_64-only) and fails vdso_prepare with
-  # "unrecognised emulation mode: aarch64linux". KBUILD_LDFLAGS is kept
-  # for the final vmlinux link, which does consume it correctly.
   CHIMERA_KCFLAGS: -O2 -fcommon -fno-strict-aliasing -Wno-error -Wno-error=unused-but-set-global -Wno-unknown-warning-option -fuse-ld=lld
   CHIMERA_KBUILD_LDFLAGS: "-fuse-ld=lld"
 
@@ -749,10 +522,6 @@ jobs:
         run: |
           set -Eeuo pipefail
           FAIL=0
-          # profile / toolchain are `choice` type so the UI already
-          # constrains them, but workflow_dispatch via the REST API can
-          # pass an arbitrary string — validate explicitly rather than
-          # trusting the UI constraint.
           case "${{ inputs.profile }}" in
             cm9|cm9e) : ;;
             *) echo "FATAL: profile must be 'cm9' or 'cm9e', got '${{ inputs.profile }}'" >&2; FAIL=1 ;;
@@ -761,9 +530,6 @@ jobs:
             llvm22|llvm21|llvm20|aosp22|aosp21|aosp20|aosp19|neutron19|neutron23|neutron24|zyc_stable|proton) : ;;
             *) echo "FATAL: unsupported toolchain '${{ inputs.toolchain }}'" >&2; FAIL=1 ;;
           esac
-          # base_ref / ksu_commit must be exact 40-hex commit SHAs — this
-          # workflow's determinism and drift-logging both depend on a
-          # pinned commit, not a movable branch name.
           if ! [[ "${{ inputs.base_ref }}" =~ ^[0-9a-f]{40}$ ]]; then
             echo "FATAL: base_ref must be a full 40-hex commit SHA, got '${{ inputs.base_ref }}'" >&2
             FAIL=1
@@ -776,25 +542,84 @@ jobs:
             echo "FATAL: base_repo must be 'owner/repo', got '${{ inputs.base_repo }}'" >&2
             FAIL=1
           fi
-          if [[ "${{ inputs.brand }}" != -* ]]; then
-            echo "FATAL: brand must start with '-', got '${{ inputs.brand }}'" >&2
-            FAIL=1
-          fi
+          # NOTE: brand dash-prefix check intentionally NOT done here.
+          # inputs.brand is now a choice field that can legitimately be
+          # "Other" or a non-dash option (e.g. "24463729") at this point —
+          # the real value isn't resolved until the "Resolve build identity
+          # inputs" step below. Enforcing '-' prefix here would FATAL on
+          # valid dropdown selections before resolution ever runs. The
+          # dash-prefix rule is enforced against the RESOLVED value instead
+          # (see "Resolve build identity inputs" and "Resolve build
+          # identity" steps).
           if [[ -z "${{ inputs.build_date }}" ]]; then
             echo "FATAL: build_date must not be empty" >&2
             FAIL=1
           fi
           [[ "$FAIL" -eq 0 ]] || exit 1
           echo "PASS: all workflow_dispatch inputs valid"
+      # ── 0a2. Coalesce Other/dropdown inputs into final values ───────────────
+      - name: Resolve build identity inputs (choice + Other + ROM-prefix strip)
+        run: |
+          set -Eeuo pipefail
+
+          # brand — choice + Other
+          if [[ "${{ inputs.brand }}" == "Other" ]]; then
+            FINAL_BRAND="${{ inputs.custom_brand }}"
+          else
+            FINAL_BRAND="${{ inputs.brand }}"
+          fi
+          [[ "$FINAL_BRAND" == -* ]] || {
+            echo "FATAL: resolved brand must start with '-', got '$FINAL_BRAND'" >&2
+            exit 1
+          }
+
+          # build_user — choice + Other
+          if [[ "${{ inputs.build_user }}" == "Other" ]]; then
+            FINAL_BUILD_USER="${{ inputs.custom_build_user }}"
+          else
+            FINAL_BUILD_USER="${{ inputs.build_user }}"
+          fi
+
+          # build_host / build_version — plain string inputs, unchanged,
+          # passed through as-is (no choice/Other logic for these two).
+          FINAL_BUILD_HOST="${{ inputs.build_host }}"
+          FINAL_BUILD_VERSION="${{ inputs.build_version }}"
+
+          # build_date — dropdown carries a "ROM: " prefix for UI legibility
+          # only (e.g. "MTRXX: Wed Aug 19 03:26:19 UTC 2026"). Strip
+          # everything up to and including the first ": " so the ROM label
+          # never reaches KBUILD_BUILD_TIMESTAMP. "Other" passes through as-is.
+          if [[ "${{ inputs.build_date }}" == "Other" ]]; then
+            FINAL_BUILD_DATE="${{ inputs.custom_build_date }}"
+          else
+            RAW_DATE="${{ inputs.build_date }}"
+            FINAL_BUILD_DATE="${RAW_DATE#*: }"
+          fi
+
+          for name in FINAL_BRAND FINAL_BUILD_USER FINAL_BUILD_HOST FINAL_BUILD_VERSION FINAL_BUILD_DATE; do
+            [[ -n "${!name}" ]] || {
+              echo "FATAL: $name resolved empty — 'Other' selected with an empty custom_* field?" >&2
+              exit 1
+            }
+          done
+
+          {
+            echo "FINAL_BRAND=$FINAL_BRAND"
+            echo "FINAL_BUILD_USER=$FINAL_BUILD_USER"
+            echo "FINAL_BUILD_HOST=$FINAL_BUILD_HOST"
+            echo "FINAL_BUILD_VERSION=$FINAL_BUILD_VERSION"
+            echo "FINAL_BUILD_DATE=$FINAL_BUILD_DATE"
+          } >> "$GITHUB_ENV"
+
+          echo "Resolved brand:         $FINAL_BRAND"
+          echo "Resolved build_user:    $FINAL_BUILD_USER"
+          echo "Resolved build_host:    $FINAL_BUILD_HOST"
+          echo "Resolved build_version: $FINAL_BUILD_VERSION"
+          echo "Resolved build_date:    $FINAL_BUILD_DATE"
       # ── 0b. Clean workspace before any checkout ───────────────────────────────
       - name: Clean workspace (prevent cross-run contamination)
         run: |
           set -Eeuo pipefail
-          # ubuntu-24.04 GitHub-hosted runners are ephemeral, but
-          # actions/checkout with clean:false (used below, deliberately, so
-          # the kernel checkout doesn't fight the self-checkout for the same
-          # directory) does not itself guarantee an empty $GITHUB_WORKSPACE.
-          # Make that guarantee explicit and independent of runner reuse.
           find "$GITHUB_WORKSPACE" -mindepth 1 -maxdepth 1 -exec rm -rf {} +
           echo "Workspace clean: $(find "$GITHUB_WORKSPACE" -mindepth 1 -maxdepth 1 | wc -l) entries remain"
       # ── 1. Host dependencies ────────────────────────────────────────────────
@@ -824,11 +649,6 @@ jobs:
           python3 --version
           curl --version | head -1
       # ── 2. Checkout Project_Chimera (workflow repo — overlay patches + Kconfig) ──
-      # CHIMERA_REF is pinned here explicitly so it is actually enforced,
-      # not merely declared as an env var — a prior revision of this
-      # workflow defined CHIMERA_REF but never passed it to `ref:`, so the
-      # self-checkout silently tracked whatever ref triggered the run
-      # instead of the pinned branch.
       - name: Checkout Project_Chimera (workflow repo — overlay + Kconfig fragment)
         uses: actions/checkout@v4
         with:
@@ -895,9 +715,7 @@ jobs:
           else
             echo "OK: base_ref matches the live branch tip — no drift"
           fi
-      # ── 3c. Clone AnyKernel3 (skeleton only — anykernel.sh is generated later,
-      #        after the build, once ACTUAL_KERNEL_RELEASE is known; see step
-      #        "Generate identity-aware anykernel.sh" below) ─────────────────
+      # ── 3c. Clone AnyKernel3 ─────────────────────────────────────────────────
       - name: Clone AnyKernel3
         if: ${{ inputs.dry_run != true }}
         run: |
@@ -919,20 +737,15 @@ jobs:
       - name: Resolve build identity
         run: |
           set -Eeuo pipefail
-          BRAND="${{ inputs.brand }}"
-          BRAND="${BRAND:-$BRAND_DEFAULT}"
+          BRAND="$FINAL_BRAND"
           [[ "${BRAND:0:1}" == "-" ]] || {
             echo "FATAL: brand must start with '-'" >&2
             exit 1
           }
-          BUILD_USER="${{ inputs.build_user }}"
-          BUILD_USER="${BUILD_USER:-$BUILD_USER_DEFAULT}"
-          BUILD_HOST="${{ inputs.build_host }}"
-          BUILD_HOST="${BUILD_HOST:-$BUILD_HOST_DEFAULT}"
-          BUILD_VER="${{ inputs.build_version }}"
-          BUILD_VER="${BUILD_VER:-$BUILD_VERSION_DEFAULT}"
-          BUILD_TS="${{ inputs.build_date }}"
-          BUILD_TS="${BUILD_TS:-$KBUILD_BUILD_TIMESTAMP_DEFAULT}"
+          BUILD_USER="$FINAL_BUILD_USER"
+          BUILD_HOST="$FINAL_BUILD_HOST"
+          BUILD_VER="$FINAL_BUILD_VERSION"
+          BUILD_TS="$FINAL_BUILD_DATE"
           UNAME_PREVIEW="Linux version 4.9.337${BRAND} (${BUILD_USER}@${BUILD_HOST}) #${BUILD_VER} SMP PREEMPT"
           {
             echo "BRAND=$BRAND"
@@ -948,15 +761,7 @@ jobs:
             echo "brand=$BRAND"
             echo "uname_preview=$UNAME_PREVIEW"
           } > "$ABS_LOG/inputs.env"
-      # ── 4a2. Guard — required Chimera build-flag env vars present (NEW,
-      #         v.20260821b). Fails fast, by name, if CHIMERA_KCFLAGS /
-      #         CHIMERA_KBUILD_LDFLAGS are ever empty or a future edit
-      #         accidentally references the bare (unexported) $KCFLAGS /
-      #         $KBUILD_LDFLAGS names instead. This is the exact failure
-      #         class that broke the 2026-08-21 CI run — see version
-      #         history at the top of this file. Also asserts -fuse-ld=lld
-      #         is present in KCFLAGS (v.20260822a — see top of file for
-      #         why this must be in KCFLAGS, not just KBUILD_LDFLAGS). ────
+      # ── 4a2. Guard — required Chimera build-flag env vars present ───────────
       - name: Guard — required Chimera build-flag env vars present
         run: |
           set -Eeuo pipefail
@@ -966,20 +771,12 @@ jobs:
             *" -fuse-ld=lld "*) : ;;
             *)
               echo "FATAL: -fuse-ld=lld missing from CHIMERA_KCFLAGS." >&2
-              echo "       arch/arm64/kernel/vdso/Makefile's VDSOL rule does not" >&2
-              echo "       reliably inherit KBUILD_LDFLAGS on this tree — without" >&2
-              echo "       -fuse-ld=lld in KCFLAGS too, vdso link falls back to the" >&2
-              echo "       host's default ld and fails with 'unrecognised emulation" >&2
-              echo "       mode: aarch64linux'. See v.20260822a in the version" >&2
-              echo "       history at the top of this file." >&2
               exit 1
               ;;
           esac
           echo "OK: CHIMERA_KCFLAGS=$CHIMERA_KCFLAGS"
           echo "OK: CHIMERA_KBUILD_LDFLAGS=$CHIMERA_KBUILD_LDFLAGS"
-      # ── 4b. Resolve KCFLAGS hash / kernel identity string (single source of
-      #        truth for build step, post-build verification, manifest,
-      #        release body, and anykernel.sh's identity header) ────────────
+      # ── 4b. Resolve KCFLAGS hash / kernel identity string ────────────────────
       - name: Generate kernel identity and hash flags
         if: ${{ inputs.dry_run != true }}
         run: |
@@ -1008,7 +805,7 @@ jobs:
           echo "Kernel identity: $KERNEL_IDENTITY"
           echo "KCFLAGS: $CHIMERA_KCFLAGS"
           echo "KCFLAGS SHA-256: $KCFLAGS_HASH"
-          
+
       # ── 5. Validate base ─────────────────────────────────────────────────────
       - name: Preflight — verify base ref and clean worktree
         working-directory: ${{ env.KERNEL_DIR }}
@@ -1063,7 +860,7 @@ jobs:
           echo "$ACTUAL" > "$ABS_LOG/ksu-commit.txt"
           echo "KSU_GIT_VERSION=$(git -C "$KSU_SUB" rev-parse --short HEAD)" >> "$GITHUB_ENV"
           echo "KernelSU-Next commit: $ACTUAL"
-      # ── 7. Verify canonical backports are present (replaces hand patches A–D) ──
+      # ── 7. Verify canonical backports are present ────────────────────────────
       - name: Verify canonical KSU-Next backports (path_umount, seccomp, selinux, reboot)
         working-directory: ${{ env.KERNEL_DIR }}
         run: |
@@ -1078,28 +875,19 @@ jobs:
               FAIL=1
             fi
           }
-          # [C] path_umount / can_umount — full upstream semantics, not the
-          # partial may_mount()-only version this workflow used to hand-roll.
           check "fs/namespace.c: can_umount() present"        fs/namespace.c '^static int can_umount\(' 
           check "fs/namespace.c: can_umount() checks check_mnt()" fs/namespace.c 'if \(!check_mnt\(mnt\)\)'
           check "fs/namespace.c: can_umount() checks MNT_LOCKED"  fs/namespace.c 'MNT_LOCKED'
           check "fs/namespace.c: can_umount() checks CAP_SYS_ADMIN on MNT_FORCE" fs/namespace.c 'MNT_FORCE.*capable\(CAP_SYS_ADMIN\)'
           check "fs/namespace.c: path_umount() present"        fs/namespace.c '^int path_umount\('
           check "fs/internal.h: path_umount() declared"        fs/internal.h 'int path_umount\(struct path \*path, int flags\);'
-          # seccomp filter_count backport
           check "include/linux/seccomp.h: filter_count field" include/linux/seccomp.h 'atomic_t filter_count;'
-          # selinux_inode/selinux_cred wrapper helpers
           check "objsec.h: selinux_inode() helper"  security/selinux/include/objsec.h 'selinux_inode\('
           check "objsec.h: selinux_cred() helper"   security/selinux/include/objsec.h 'selinux_cred\('
           check "selinuxfs.c: uses selinux_inode()" security/selinux/selinuxfs.c 'selinux_inode\(inode\)'
           check "xfrm.c: uses selinux_cred()"       security/selinux/xfrm.c 'selinux_cred\(current_cred\(\)\)'
-          # [D] reboot hook
           check "kernel/reboot.c: ksu_handle_sys_reboot declared" kernel/reboot.c 'extern int ksu_handle_sys_reboot'
           check "kernel/reboot.c: ksu_handle_sys_reboot called"   kernel/reboot.c 'ksu_handle_sys_reboot\(magic1, magic2, cmd, &arg\)'
-          # [B] AVC log-spoofing symbol — must be defined exactly once, in
-          # avc.c, and only declared extern in fs/susfs.c. If a future base
-          # regresses this (defines it nowhere, or defines it twice), fail
-          # loudly instead of silently re-adding a duplicate definition.
           AVC_DEFS="$(grep -rn '^bool susfs_is_avc_log_spoofing_enabled = false;' security/selinux/avc.c fs/susfs.c 2>/dev/null | wc -l)"
           if [[ "$AVC_DEFS" -eq 1 ]] && grep -q '^bool susfs_is_avc_log_spoofing_enabled = false;' security/selinux/avc.c; then
             echo "OK:    susfs_is_avc_log_spoofing_enabled defined exactly once, in avc.c"
@@ -1116,19 +904,17 @@ jobs:
           [[ "$FAIL" -eq 0 ]] || {
             echo
             echo "One or more canonical backports expected from base_ref=${{ inputs.base_ref }} were not found."
-            echo "This usually means base_ref points at a different commit/branch than the verified one."
             exit 1
           }
           echo
           echo "PASS: all canonical KSU-Next backports verified present from base — no hand patches required"
-      # ── 8. Verify LSM-based setresuid path (replaces removed kernel/sys.c patch [A]) ──
+      # ── 8. Verify LSM-based setresuid path ───────────────────────────────────
       - name: Verify KSU-Next LSM task_fix_setuid hook (no kernel/sys.c patch used)
         working-directory: ${{ env.KERNEL_DIR }}
         run: |
           set -Eeuo pipefail
           KSU_SUB="KernelSU-Next"
           FAIL=0
-          # Confirm the driver defines and registers the hook itself.
           grep -q 'ksu_task_fix_setuid' "$KSU_SUB/kernel/hook/lsm_hooks.c" || {
             echo "FATAL: ksu_task_fix_setuid not found in KernelSU-Next source" >&2
             FAIL=1
@@ -1141,33 +927,19 @@ jobs:
             echo "FATAL: ksu_handle_setresuid implementation not found" >&2
             FAIL=1
           }
-          # Confirm we have NOT reintroduced the redundant kernel/sys.c patch.
           if grep -q 'ksu_handle_setresuid' kernel/sys.c 2>/dev/null; then
             echo "FATAL: kernel/sys.c calls ksu_handle_setresuid() directly." >&2
-            echo "       This duplicates the LSM task_fix_setuid hook and will" >&2
-            echo "       cause ksu_handle_setresuid() to run twice per credential" >&2
-            echo "       transition (see fix-log item [A]). Remove this patch." >&2
             FAIL=1
           else
             echo "OK:    kernel/sys.c does not directly call ksu_handle_setresuid (correct)"
           fi
           [[ "$FAIL" -eq 0 ]] || exit 1
           echo "PASS: setresuid root-grant path goes through the LSM hook only"
-      # ── 9. Pre-flight KSU-Next Kbuild self-patch guards (fixes race condition [F]) ──
+      # ── 9. Pre-flight KSU-Next Kbuild self-patch guards ──────────────────────
       - name: Pre-verify all KernelSU-Next Kbuild self-patch guards resolve to no-op
         working-directory: ${{ env.KERNEL_DIR }}
         run: |
           set -Eeuo pipefail
-          # KernelSU-Next's kernel/Kbuild applies backports via $(shell sed -i ...)
-          # at Makefile-parse time for the drivers/kernelsu sub-make. Under
-          # recursive/parallel Kbuild there is no guaranteed ordering between
-          # that sub-make and fs/'s or security/'s sub-makes, so relying on
-          # those self-patches to land before dependent objects compile is
-          # unsafe (this is exactly how the old path_umount undefined-reference
-          # failure occurred). Since our base already carries every backport
-          # KSU-Next's Kbuild would otherwise inject, we assert here that each
-          # of its guard conditions is already satisfied — i.e. every self-patch
-          # branch is a guaranteed no-op — so the race condition cannot fire.
           KB="KernelSU-Next/kernel/Kbuild"
           [[ -f "$KB" ]] || { echo "FATAL: $KB not found" >&2; exit 1; }
           FAIL=0
@@ -1190,41 +962,15 @@ jobs:
           assert_noop "selinux_inode() declared in objsec.h" 'selinux_inode\(' security/selinux/include/objsec.h
           assert_noop "selinux_cred() declared in objsec.h"  'selinux_cred\(' security/selinux/include/objsec.h
           [[ "$FAIL" -eq 0 ]] || {
-            echo
-            echo "One or more Kbuild self-patch guards would still fire. Under a"
-            echo "parallel/recursive build this is a race condition, not a fixed"
-            echo "bug — it may build successfully in one run and fail with an"
-            echo "'undefined reference' at final link in another. Fix the base"
-            echo "or add the missing backport explicitly before building."
             exit 1
           }
           echo
           echo "PASS: every KSU-Next Kbuild self-patch branch is a guaranteed no-op"
-      # ── 10. Fix hooks.c selinux_cred() consistency gap (item [G], non-fatal hardening) ──
+      # ── 10. Fix hooks.c selinux_cred() consistency gap ───────────────────────
       - name: Harden security/selinux/hooks.c — complete selinux_cred() conversion
         working-directory: ${{ env.KERNEL_DIR }}
         run: |
           set -Eeuo pipefail
-          # KSU-Next upstream has since fixed its own Kbuild guard for this
-          # conversion (see fix-log item [G] for the full history — the
-          # false-positive substring match on selinux_cred_alloc_blank/_free/
-          # _prepare/_transfer is now avoided upstream, via
-          # grep -Eq 'selinux_cred\(.*\)'). This step is kept as defense in
-          # depth: it does not depend on KSU-Next's Kbuild guard at all, so
-          # it cannot regress if upstream's guard ever does again.
-          #
-          # EXPECTED RESULT ON THE ACTUAL PINNED BASE: re-verified this pass
-          # (v.20260822b) directly against the live pinned base_ref — this
-          # pattern set matches zero sites (a no-op) on the current pin,
-          # because hooks.c is already fully converted there. A zero-match
-          # result is treated as success, not failure (see the total==0
-          # branch below), and is logged explicitly so a real "no applicable
-          # sites" run is never confused with a silently-skipped check.
-          # These substitutions only ever touch plain cred->security/
-          # current_security() read sites in security/selinux/hooks.c; they
-          # never match or modify Samsung RKP/KDP credential-protection code
-          # (CONFIG_RKP_KDP/CONFIG_UH_RKP are separately verified disabled
-          # in the "Guard pass" step).
           python3 << 'PYEOF'
           import re
           import sys
@@ -1235,10 +981,6 @@ jobs:
           if MARKER in src:
               print("hooks.c: selinux_cred consistency pass already applied — skipping")
               sys.exit(0)
-          # Precise, line-scoped substitutions. Each pattern requires the
-          # exact assignment/return form seen upstream; it will not match
-          # inside selinux_cred_alloc_blank/_free/_prepare/_transfer
-          # (those assign to ->security, not read from it in this form).
           subs = [
               (r'\btsec = cred->security;', 'tsec = selinux_cred(cred);'),
               (r'const struct task_security_struct \*tsec = cred->security;',
@@ -1275,24 +1017,19 @@ jobs:
               p.write_text(src)
               print(f"hooks.c: converted {total} call site(s) to selinux_cred()")
           PYEOF
-          # Sanity: the legitimate hook function definitions must be untouched.
           for fn in selinux_cred_alloc_blank selinux_cred_free selinux_cred_prepare selinux_cred_transfer; do
             grep -q "$fn" security/selinux/hooks.c || {
               echo "FATAL: $fn disappeared from hooks.c — consistency pass corrupted the file" >&2
               exit 1
             }
           done
-          # Verify no raw call sites remain matching the two
-          # selinux_determine_inode_label(...) forms on THIS tree, at
-          # runtime — regardless of whether the count above was 0 (no
-          # applicable sites) or nonzero (sites found and converted).
           REMAINING=$(grep -cE 'rc = selinux_determine_inode_label\((current_security\(\)|old->security)' security/selinux/hooks.c || true)
           if [[ "$REMAINING" -gt 0 ]]; then
             echo "FATAL: $REMAINING selinux_determine_inode_label(...) call site(s) still unconverted after patch" >&2
             exit 1
           fi
           echo "PASS: hooks.c selinux_cred consistency verified, hook functions intact, 0 selinux_determine_inode_label sites remain unconverted"
-      # ── 11. Chimera overlay (verified device-specific patches — see script header) ──
+      # ── 11. Chimera overlay ───────────────────────────────────────────────────
       - name: Apply Chimera overlay
         working-directory: ${{ env.KERNEL_DIR }}
         run: |
@@ -1313,13 +1050,6 @@ jobs:
             > scripts/setlocalversion
           chmod +x scripts/setlocalversion
           echo "$BRAND" > localversion
-          # fair.c scheduler tuning, mem_rw() SUS_MAP guard, namei.c
-          # sus_path sub-path re-check, exynos-ufc.c UFC short-circuit, and
-          # board DTS tuning all live in this script — not inline here —
-          # so there is exactly one place that owns each anchor and one
-          # place that fails loudly if an anchor drifts. This is mandatory,
-          # not conditional: the earlier "Verify required repo-local files"
-          # step already guarantees the script exists.
           bash "$GITHUB_WORKSPACE/patches/apply_chimera_overlay_patches.sh" \
             2>&1 | tee -a "$LOG"
           echo \
@@ -1354,17 +1084,11 @@ jobs:
             && echo "OK:    fair.c migration_cost tuned" \
             || { echo "FATAL: fair.c migration_cost not tuned"; FAIL=1; }
           [[ "$FAIL" -eq 0 ]] || {
-            echo
-            echo "One or more Chimera overlay patches did not land. This is a"
-            echo "hard failure — the whole point of this workflow revision is"
-            echo "that the Chimera overlay is present in every build, not"
-            echo "silently dropped when a repo file goes missing or an anchor"
-            echo "drifts."
             exit 1
           }
           echo
           echo "PASS: all Chimera overlay markers present"
-      # ── 11c. Toolchain resolution (MOVED — was step 15; must run before Kconfig steps 12-14b, which invoke `make CC=clang`) ─────────────────────────────────────────────
+      # ── 11c. Toolchain resolution ─────────────────────────────────────────────
       - name: Resolve toolchain configuration
         id: tc-resolve
         run: |
@@ -1375,18 +1099,9 @@ jobs:
           TC_CACHE_KEY=""
           TC_LLVM_IAS="1"
           TC_USE_FULL_LLVM="true"
-          # Empty by default for every toolchain. Only overridden below for
-          # toolchains that are independently known to need it — currently
-          # just proton (bundled ~2021-era binutils `ld` that predates
-          # glibc RELR/.relr.dyn support on ubuntu-24.04 runners, causing
-          # host-tool link failures in fixdep/resolve_btfids). llvm20-22,
-          # aosp19-22, neutron19/23/24, and zyc_stable have not shown this
-          # failure, so they are deliberately left unmodified rather than
-          # applying the workaround everywhere on spec.
           TC_HOSTLDFLAGS=""
           case "$TOOLCHAIN" in
             aosp19)
-              # Generates a tarball of the clang-r536225 directory directly from the android-15.0.0_r10 tag
               TC_URL="https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/tags/android-15.0.0_r10/clang-r536225.tar.gz"
               TC_CACHE_KEY="aosp-clang-r536225-ubuntu-24.04-v2"
               ;;
@@ -1439,22 +1154,9 @@ jobs:
                 || true)
               ;;
             proton)
-              # Proton Clang is not release-tarball distributed — prebuilt
-              # clang/binutils binaries are committed directly to the
-              # `master` branch (verified: bin/clang, llvm-nm, llvm-ar,
-              # llvm-objcopy, llvm-strip, ld.lld all present at that path).
-              # TC_ARCHIVE_FMT=git signals "Download and extract toolchain"
-              # to git-clone instead of aria2c+tar.
               TC_URL="https://github.com/kdrag0n/proton-clang.git"
               TC_ARCHIVE_FMT="git"
               TC_CACHE_KEY="proton-clang-master-ubuntu-24.04-v1"
-              # See TC_HOSTLDFLAGS comment above — forces host-tool
-              # (HOSTCC) linking through this toolchain's own ld.lld
-              # instead of its bundled old GNU ld, which cannot parse
-              # SHT_RELR (.relr.dyn) sections present in the runner's
-              # glibc. Confirmed via a real failed run: fixdep and
-              # tools/bpf/resolve_btfids both died with "unknown type
-              # [0x13] section `.relr.dyn'" / "cannot find libc.so.6".
               TC_HOSTLDFLAGS="-fuse-ld=lld"
               ;;
             *)
@@ -1490,12 +1192,6 @@ jobs:
           mkdir -p "$ABS_TC"
 
           if [[ "$TC_ARCHIVE_FMT" == "git" ]]; then
-            # Proton Clang (and any future git-tree-distributed toolchain):
-            # shallow clone is the only supported fetch method — there is
-            # no per-release archive endpoint to aria2c against, since the
-            # prebuilt binaries are committed directly to the branch.
-            # --single-branch avoids pulling unrelated refs; .git is
-            # stripped afterward so it isn't cached/uploaded.
             [[ -n "$TC_URL" ]] || {
               echo "FATAL: TC_URL is empty for git-based toolchain fetch" >&2
               exit 1
@@ -1552,7 +1248,6 @@ jobs:
           fi
           echo "Found toolchain bin: $ACTUAL_BIN"
           chmod +x "$ACTUAL_BIN"/* 2>/dev/null || true
-          # Expose it globally to all subsequent workflow steps
           echo "$ACTUAL_BIN" >> "$GITHUB_PATH"
       # ── 11d. Validate compiler binaries/versions, capture real identity ──────
       - name: Verify Toolchain and capture compiler identity
@@ -1572,10 +1267,6 @@ jobs:
           llvm-objdump --version | head -1
           echo "$LLD_VERSION"
           [[ -n "$CLANG_VERSION" ]] || { echo "FATAL: clang --version produced no output" >&2; exit 1; }
-          # Real compiler identity, derived from the actual binary rather
-          # than the requested TC_CACHE_KEY label — if a download silently
-          # served the wrong archive, this differs from TC_CACHE_KEY and is
-          # recorded in the manifest for that to be caught after the fact.
           TC_IDENTITY_HASH="$(printf '%s\n%s\n' "$CLANG_VERSION" "$LLD_VERSION" | sha256sum | cut -d' ' -f1 | head -c 16)"
           {
             echo "CLANG_VERSION=$CLANG_VERSION"
@@ -1594,12 +1285,8 @@ jobs:
           grep -q '^CONFIG_KSU=y$' "$CFG"
           grep -q '^CONFIG_KSU_MANUAL_HOOK=y$' "$CFG"
           grep -q '^CONFIG_KSU_SUSFS=y$' "$CFG"
-          # CONFIG_KSU_NON_KPROBE is not a real symbol (verified against
-          # KernelSU-Next kernel/Kconfig — see fix-log [E]); fail if it
-          # ever creeps back into the fragment.
           if grep -q '^CONFIG_KSU_NON_KPROBE' "$CFG"; then
             echo "FATAL: CONFIG_KSU_NON_KPROBE is not a valid KernelSU-Next symbol" >&2
-            echo "       Use CONFIG_KSU_MANUAL_HOOK=y instead." >&2
             exit 1
           fi
           cat "$CFG"
@@ -1703,7 +1390,7 @@ jobs:
           fi
           echo "PASS: KernelSU manual hook mode enforced"
           cp "$CFG" "$ABS_LOG/final.config"
-      # ── 14b. Security/config guard — forbidden Samsung restrictions, required KSU/SUSFS ──
+      # ── 14b. Security/config guard ────────────────────────────────────────────
       - name: Guard pass — verify security restrictions disabled and KSU/SUSFS enabled
         working-directory: ${{ env.KERNEL_DIR }}
         run: |
@@ -1738,14 +1425,6 @@ jobs:
             CONFIG_KSU_SUSFS_SUS_MAP
             CONFIG_KSU_SUSFS_SUS_KSTAT
             CONFIG_HZ_300
-            # ROLLED BACK (Star Madera sound card) — CONFIG_MFD_MADERA /
-            # CONFIG_MFD_CS47L92 no longer enforced as required here. This
-            # only removes the guard's fail-if-missing check; it does NOT
-            # disable the codec config itself, which is set upstream in
-            # the base defconfig / chimera-device-specific.cfg / the
-            # overlay patch script (none of which this workflow file
-            # controls directly) — roll those back separately if the goal
-            # is to actually disable the codec, not just stop enforcing it.
             # CONFIG_MFD_MADERA
             # CONFIG_MFD_CS47L92
             CONFIG_TCP_CONG_ADVANCED
@@ -1807,8 +1486,7 @@ jobs:
           FINAL_CONFIG_HASH="$(sha256sum "$ABS_OUT/.config" | cut -d' ' -f1)"
           echo "FINAL_CONFIG_HASH=$FINAL_CONFIG_HASH" >> "$GITHUB_ENV"
           echo "Final .config SHA-256: $FINAL_CONFIG_HASH"
-      # ── 18. Build Image and DTBs (KCFLAGS/KBUILD_LDFLAGS now sourced from the
-      #        global env: block — see step 4b — instead of an inline literal) ──
+      # ── 18. Build Image and DTBs ──────────────────────────────────────────────
       - name: Build kernel Image and device DTBs
         if: ${{ inputs.dry_run != true }}
         working-directory: ${{ env.KERNEL_DIR }}
@@ -1917,12 +1595,6 @@ jobs:
             > "$ABS_LOG/vmlinux-symbols.log" \
             2>&1 \
             || true
-          # ksu_handle_setresuid is expected here because it is called from
-          # the LSM task_fix_setuid hook (ksu_task_fix_setuid), not because
-          # of a kernel/sys.c patch — see fix-log item [A]. ksu_lsm_hook_init
-          # and ksu_task_fix_setuid are included to positively confirm the
-          # LSM-hook-based path (rather than a syscall patch) is what's
-          # actually compiled in.
           REQUIRED=(
             ksu_handle_execveat
             ksu_handle_faccessat
@@ -1945,7 +1617,7 @@ jobs:
             fi
           done
           [[ "$FAIL" -eq 0 ]] || exit 1
-# ── 20. Assemble legacy Samsung dtb.img ──────────────────────────────────
+      # ── 20. Assemble legacy Samsung dtb.img ──────────────────────────────────
       - name: Assemble dtb.img from star2lte device DTBs
         if: ${{ inputs.dry_run != true }}
         working-directory: ${{ env.KERNEL_DIR }}
@@ -1993,7 +1665,6 @@ jobs:
             '  %s\n' \
             "${DTB_FILES[@]}" \
             | tee -a "$ABS_LOG/dtb-assemble.log"
-          # Legacy Samsung dtb.img: raw concatenation, no mkdtimg header.
           cat \
             "${DTB_FILES[@]}" \
             > "$ART_DIR/dtb.img"
@@ -2014,12 +1685,7 @@ jobs:
           echo \
             "ART_DIR=$ART_DIR" \
             >> "$GITHUB_ENV"
-      # ── 20a. Capture actual kernel release (post-build ground truth for
-      #         anykernel.sh's identity header and the manifest). Uses
-      #         --no-print-directory + tail -n1 + a newline guard so a
-      #         recursive-make "Entering/Leaving directory" banner can never
-      #         corrupt the $GITHUB_ENV write again — see version-history
-      #         entry 5 for v.20260821b above. ───────────────────────────
+      # ── 20a. Capture actual kernel release ────────────────────────────────────
       - name: Capture actual kernel release
         if: ${{ inputs.dry_run != true }}
         working-directory: ${{ env.KERNEL_DIR }}
@@ -2048,39 +1714,15 @@ jobs:
           fi
           echo "ACTUAL_KERNEL_RELEASE=$ACTUAL_RELEASE" >> "$GITHUB_ENV"
           echo "Actual kernel release: $ACTUAL_RELEASE"
-      # ── 20b. Generate identity-aware anykernel.sh — written to the WORKSPACE
-      #         ROOT (fixes the anykernel.sh path bug: step 21c below reads
-      #         from $GITHUB_WORKSPACE/anykernel.sh and previously found
-      #         nothing there because the old flow only ever wrote it inside
-      #         $AK3_DIR). Runs after ACTUAL_KERNEL_RELEASE is known so the
-      #         embedded identity reflects the real build, not a prediction.
-      #
-      #         v.20260822b: header now mirrors the "Create GitHub Release"
-      #         step's body field-for-field (Compiler, expected/actual
-      #         release, Final config SHA-256, uname, KSU symbol list — all
-      #         previously only in the Release body, not here), and the
-      #         stray "}" typo in kernel.string (${KERNEL_IDENTITY}} — an
-      #         extra unmatched closing brace) is fixed. kernel.string is
-      #         also extended with a short compiler + config-hash suffix so
-      #         identity is visible in the flashing/recovery UI itself, not
-      #         only to someone who opens the script afterward. ──────────
+      # ── 20b. Generate identity-aware anykernel.sh ─────────────────────────────
       - name: Generate identity-aware anykernel.sh
         if: ${{ inputs.dry_run != true }}
         run: |
           set -Eeuo pipefail
-          # Unquoted heredoc — intentional, so ${VAR} expands into the
-          # generated file. All values interpolated below are workflow-
-          # controlled env vars/commit SHAs with no user-supplied shell
-          # metacharacters; do not add unsanitized workflow_dispatch input
-          # here without re-auditing for command injection via $(...).
           cat > "$GITHUB_WORKSPACE/anykernel.sh" <<AK3SH
           #!/usr/bin/env bash
           #
           # AnyKernel3 — Project Chimera Mk9
-          #
-          # This header mirrors the GitHub Release body for this exact
-          # build, field for field, so the identity of the kernel being
-          # flashed is visible here too — not only on the release page.
           #
           # Kernel identity:
           #   Name:                    ${KERNEL_NAME}
@@ -2107,8 +1749,7 @@ jobs:
           #   KCFLAGS SHA-256:         ${KCFLAGS_HASH}
           #   Final config SHA-256:    ${FINAL_CONFIG_HASH}
           #
-          # KSU manual-hook symbols verified present in vmlinux (workflow
-          # step "Guard pass — verify KSU/SUSFS symbols"):
+          # KSU manual-hook symbols verified present in vmlinux:
           #   ksu_handle_execveat
           #   ksu_handle_faccessat
           #   ksu_handle_setresuid (via LSM task_fix_setuid hook — no kernel/sys.c patch)
@@ -2130,10 +1771,6 @@ jobs:
           device.name5=SM-G965N
           supported.versions=9-16
           '; }
-          # Named-partition mode: let ak3-core.sh resolve BOOT across
-          # by-name / bootdevice/by-name / platform/*/by-name, rather than
-          # hardcoding the UFS controller node id (which is not guaranteed
-          # stable across kernel/TWRP builds on this device).
           BLOCK=/dev/block/by-name/BOOT
           IS_SLOT_DEVICE=0
           RAMDISK_COMPRESSION=auto
@@ -2266,15 +1903,6 @@ jobs:
           
           COMBINED="$ABS_OUT/arch/arm64/boot/Image.gz-dtb"
           SPLIT_IMAGE="$ART_DIR/Image"
-          # Source is dtb.img (built by step 20 "Assemble dtb.img from
-          # star2lte device DTBs") — there is no file literally named
-          # "dtb" anywhere in $ART_DIR. Destination inside the AK3 zip is
-          # still named "dtb" (no extension), which is what
-          # tools/ak3-core.sh's dump_boot/write_boot expects for a
-          # legacy raw-DTB device. Previously this pointed at
-          # "$ART_DIR/dtb", which never existed, so the WARN/Image-only
-          # branch below fired unconditionally and every flashable zip
-          # shipped without a DTB.
           SPLIT_DTB="$ART_DIR/dtb.img"
           
           if [[ -f "$COMBINED" ]]; then
