@@ -414,7 +414,7 @@ on:
         type: choice
         options:
           - "-Chimera_Mk9"
-          - "24463729"
+          - "-24463729"
           - "Other"
         default: "-Chimera_Mk9"
       custom_brand:
