@@ -626,13 +626,13 @@ on:
         description: "Base ref: full 40-hex commit SHA only (not a branch name — see fix-log item [I]). Default is the current pin of record; the live branch tip is logged for drift but never substituted automatically."
         required: false
         type: string
-        default: "cd3c976e1d25fe915fc664d208a97b7a40ec2aac"
+        default: "028e276e5a5f83ea8170ee8e65bedf327852a9c0"
 
       ksu_commit:
         description: "KernelSU-Next exact commit SHA (full 40-hex, pin; overrides submodule-pinned commit if different) — must be bumped together with base_ref, see fix-log item [I]"
         required: false
         type: string
-        default: "e3474221f324eb564587bc1d43578261a10defcb"
+        default: "685b4a6ba3d2befdf40b3c67cf096d050c7aa6cb"
 
       base_branch_hint:
         description: "Branch name to compare base_ref against for drift logging ONLY — never used as the actual checkout ref"
@@ -674,7 +674,7 @@ on:
         description: "KBUILD_BUILD_TIMESTAMP"
         required: false
         type: string
-        default: "(MTRXX: Wed Aug 19 03:26:19 UTC 2026 / LOS232: Fri Aug 14 10:18:07 CEST 2026 / EVOXV: Tue Aug 11 10:23:04 UTC 2026 / EVOXGMS: Tue Aug 11 13:18:57 UTC 2026 / HLCYN: Tue Aug 18 13:16:25 UTC 2026"
+        default: "(MTRXX: Wed Aug 19 03:26:19 UTC 2026 / LOS232: Fri Aug 14 10:18:07 CEST 2026 / EVOXV: Tue Aug 11 10:23:04 UTC 2026 / EVOXGMS: Tue Aug 11 13:18:57 UTC 2026 / HLCYN: Tue Aug 18 13:16:25 UTC 2026 / DRP: Tue Aug 11 07:06:26 UTC 2026)"
 
 env:
   CHIMERA_REPO: "https://github.com/royd-jpg/Project_Chimera.git"
